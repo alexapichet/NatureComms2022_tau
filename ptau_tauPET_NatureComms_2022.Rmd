@@ -1,0 +1,483 @@
+---
+title: "NatureComms_2022_ptau_tauPET"
+output: html_document
+date: "2022-10-10"
+---
+
+```{r setup, include=FALSE}
+library(cowplot)
+library(ggplot2)
+library(ggsci)
+library(readxl)
+library(writexl)
+library(lme4)
+library(lmerTest)
+library(mixtools)
+library(mclust)
+library(NetworkToolbox)
+library(lm.beta)
+library(dplyr)
+
+```
+
+
+# Read in data
+
+## --\> set source and target directory
+
+```{r}
+# root directory in which all the project data is stored
+dir.root = "set_up_your_path"
+
+# source directory in which the input spreadsheet containing all data is stored
+dir.source = paste0(dir.root, "/data_sheets/")
+dir.target = dir.source
+
+# directory in which quality control data for GMM models should be stored
+dir.quality.control = paste0(dir.root, "/quality_control/")
+dir.create(dir.quality.control, recursive = T)
+
+# directory in which the workbench software is stored and in which all surface renderings should be stored
+dir.workbench.software = paste0(dir.root, "/software/workbench/")
+dir.workbench = paste0(dir.root, "/workbench/surface_renderings/")
+dir.create(dir.workbench, recursive = T)
+
+# directory in which the Schaefer atlas is stored
+dir.atlas = paste0(dir.root, "/data/nifti/Schaefer_2mm/")
+
+```
+
+## Organize and filter data
+
+```{r pressure, echo=FALSE}
+pet.tau.amyloid.longitudinal.ROC.SUVR <- read_xlsx(paste0(dir.source, "BF2_Tau_Amyloid_Longitudinal_ROC_all_options.xlsx"))
+
+
+pet.tau.amyloid.longitudinal.ROC.SUVR$global.amyloid <- pet.tau.amyloid.longitudinal.ROC.SUVR$fnp_ber_com_composite
+pet.tau.amyloid.longitudinal.ROC.SUVR$global.amyloid.status <- ifelse(pet.tau.amyloid.longitudinal.ROC.SUVR$fnp_ber_com_composite >= 0.53, "Ab.pos", "Ab.neg")
+
+# concatenate diagnosis and amyloid status
+pet.tau.amyloid.longitudinal.ROC.SUVR$DX.Ab <- paste0(pet.tau.amyloid.longitudinal.ROC.SUVR$diagnosis, ".", pet.tau.amyloid.longitudinal.ROC.SUVR$global.amyloid.status)
+
+pet.tau.amyloid.longitudinal.ROC.SUVR$global.amyloid <- as.numeric(pet.tau.amyloid.longitudinal.ROC.SUVR$global.amyloid)
+
+## Generate CSF Ab-ratio 
+pet.tau.amyloid.longitudinal.ROC.SUVR$CSF_Ab42_40_ratio_NTK <- (pet.tau.amyloid.longitudinal.ROC.SUVR$CSF_Ab42_pgml_imputed_NTK / (pet.tau.amyloid.longitudinal.ROC.SUVR$CSF_Ab40_ngml_imputed_NTK*1000) )  #put in same unit
+
+## REMOVE PARTICIPANTS WITH HIGH MENINGEAL BINDING
+sub.pet.tau.amyloid.longitudinal.ROC.SUVR <- subset(pet.tau.amyloid.longitudinal.ROC.SUVR, (meningeal_ratio_bl<=1.75 & to_exclude!=1))
+```
+
+
+### Function to create surface renderings on Connectome Workbench
+
+```{r}
+
+# render to Schaefer atlas function 200 ROIs
+render_to_Schaefer_200 <- function(path_to_200_ROI_vector_txt_file, output_folder, out_file){
+  
+  Schaefer_dlabel=paste0(dir.atlas, "/cifti/Schaefer2018_200Parcels_7Networks_order.dlabel.nii")
+  Schaefer_dscalar=paste0(dir.atlas, "/cifti/Schaefer2018_200Parcels_7Networks_order.dscalar.nii")
+  Schaefer_pscalar=paste0(dir.atlas, "/cifti/Schaefer2018_200Parcels_7Networks_order.pscalar.nii")
+  
+  # render pet mean change
+  command1="#!/bin/sh"
+  command2=paste0("export PATH=$PATH:", dir.workbench.software, "/bin_macosx64")
+  command3=paste0("wb_command -cifti-convert -from-text ", path_to_200_ROI_vector_txt_file, " ",Schaefer_pscalar, " ", out_file)
+  
+  writeLines(c(command1, command2, command3), paste0(output_folder, "/tmp_render_to_workbench.sh"))
+  bash_command=paste0("bash ", paste0(output_folder, "/tmp_render_to_workbench.sh"))
+  system(bash_command)
+  
+}
+
+```
+
+### Create surface renderings - tau-PET baseline SUVR, Rate of change from LME
+
+```{r}
+
+groups = list(c("CU.Ab.neg"), c("CU.Ab.pos"), c("MCI.Ab.neg"), c("MCI.Ab.pos"),c("AD.Ab.pos"),c("CU.Ab.pos","MCI.Ab.pos"))
+groups.label = c("CU.Ab.neg", "CU.Ab.pos", "MCI.Ab.neg", "MCI.Ab.pos","AD.Ab.pos","CU.MCI.Ab.pos")
+
+for (i in 1:length(groups)){
+  # define target group
+  current.group = groups[i]
+  current.group.label = groups.label[i]
+
+  outfile = paste0("mean_tau_ROC_", current.group.label)
+  #outfile = paste0("mean_tau_suvr_", current.group.label)
+ 
+  # create output directory
+  dir.out.tmp = paste0(dir.workbench, "/tau_ROC_LME/")
+  #dir.out.tmp = paste0(dir.workbench, "/tau_SUVR/")
+  dir.create(dir.out.tmp, recursive = T, showWarnings = F)
+  
+  # select group
+  tmp <- sub.pet.tau.amyloid.longitudinal.ROC.SUVR
+  tmp <- subset(tmp, group %in% current.group)
+  
+  # extract PET SUVR or ROC
+  tmp.pet <- select(tmp, paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200,".ROC"))
+  #tmp.pet <- select(tmp,paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200))
+  
+  # create group mean PET
+  tmp.pet <- colMeans(as.matrix(tmp.pet), na.rm = TRUE)
+
+  
+  # render to workbench
+  outfile_txt=paste0(dir.out.tmp, outfile,".txt")
+  write.table(tmp.pet,file = outfile_txt, row.names = F, col.names = F)
+  outfile_cifti=paste0(dir.out.tmp, outfile,".pscalar.nii")
+  render_to_Schaefer_200(outfile_txt, dir.out.tmp, outfile_cifti)
+  
+}
+
+```
+
+## Linear models relating Ab-PET and CSF p-tau with tau-PET rate of change
+```{r}
+
+ROI.names=c(1:200)
+
+#Create dataframe to store results 
+
+newnames=c('StdB.intercept','StdB.age','StdB.sex','StdB.Ab','StdB.CSFptau',
+           'p.intercept','p.age','p.sex','p.Ab','p.CSFptau',
+           'StdB.Ab.intercept','StdB.Ab.age','StdB.Ab.sex','StdB.Ab.Ab',
+           'p.Ab.intercept','p.Ab.age','p.Ab.sex','p.Ab.Ab',
+           'StdB.ptau.intercept','StdB.ptau.age','StdB.ptau.sex','StdB.ptau.CSFptau',
+           'p.ptau.intercept','p.ptau.age','p.ptau.sex','p.ptau.CSFptau',
+           'Whole.model.adjR2','Whole.model.p',
+           'Ab.model.adjR2','Ab.model.p',
+           'CSF.model.adjR2','CSF.model.p',
+           'StdB.bl.intercept','StdB.bl.age','StdB.bl.sex','StdB.bl.Ab','StdB.bl.CSFptau', 'StdB.bl.tauSUVR',
+           'p.bl.intercept','p.bl.age','p.bl.sex','p.bl.Ab','p.bl.CSFptau', 'p.bl.tauSUVR',
+           'StdB.cov.intercept','StdB.cov.age','StdB.cov.sex','p.cov.intercept','p.cov.age','p.cov.sex')
+
+beta.ptau217.abeta=data.frame(matrix(ncol = 50, nrow = 200))
+names(beta.ptau217.abeta) <- newnames
+
+## Make sure models are run according to same names of beta.ptau.abeta dataframe
+# 1. Model including CSF ptau and regional Ab-PET
+# 2. Model including only regional Ab-PET
+# 3. Model including only CSF p-tau
+# 4. Model including CSF ptau and regional Ab-PET and baseline tau-PET
+  
+for (i in 1:length(ROI.names)){
+  svMisc::progress(i, max.value = length(ROI.names))
+  
+   # select data
+temp <- (sub.pet.tau.amyloid.longitudinal.ROC.SUVR[,c('MR_ID','CSF_ptau217_pgml_Lilly',
+             'age_bl', 'gender', paste0("tau.SUVR.Schaefer200.ROI.idx.", i),
+           paste0("amyloid.SUVR.Schaefer200.ROI.idx.", i),
+         paste0("tau.SUVR.Schaefer200.ROI.idx.", i,".ROC"),'diagnosis','DX.Ab')])
+
+temp<-na.omit(subset(temp,(DX.Ab=="Control.Ab.pos" | DX.Ab=="MCI.Ab.pos"))) ## Change participants selection for other groups
+
+# Rename columns to make regression models easier
+## MAKE SURE INDEX MATCHES WITH TEMP DATASET
+colnames(temp)[6] <- "amyloid.ROI"
+colnames(temp)[5] <- "tau.bl.ROI"
+colnames(temp)[7] <- "tau.ROC.ROI"
+temp$amyloid.ROI<-as.numeric(temp$amyloid.ROI)
+temp$gender<-as.factor(temp$gender)
+
+tmp.lm <- lm(tau.ROC.ROI ~ age_bl + gender + amyloid.ROI + CSF_ptau217_pgml_Lilly, 
+               data = temp)
+
+tmp.lm.ab <- lm(tau.ROC.ROI ~ age_bl + gender + amyloid.ROI , 
+               data = temp)
+
+tmp.lm.ptau <- lm(tau.ROC.ROI ~ age_bl + gender + CSF_ptau217_pgml_Lilly, 
+               data = temp)
+
+tmp.lm.bltau <- lm(tau.ROC.ROI ~ age_bl + gender + amyloid.ROI + CSF_ptau217_pgml_Lilly + tau.bl.ROI, 
+               data = temp)
+
+tmp.lm.age.sex <- lm(tau.ROC.ROI ~ age_bl + gender, 
+               data = temp)
+
+
+std.beta <- lm.beta(tmp.lm)
+std.beta.ab <- lm.beta(tmp.lm.ab)
+std.beta.ptau <- lm.beta(tmp.lm.ptau)
+std.beta.bltau <- lm.beta(tmp.lm.bltau)
+std.beta.age.sex <- lm.beta(tmp.lm.age.sex)
+
+sum.lm <- summary(tmp.lm)
+sum.lm.ab <- summary(tmp.lm.ab)
+sum.lm.ptau <- summary(tmp.lm.ptau)
+sum.lm.bltau <- summary(tmp.lm.bltau)
+sum.lm.age.sex <- summary(tmp.lm.age.sex)
+
+beta.ptau217.abeta[i,1:5]<-std.beta$standardized.coefficients
+beta.ptau217.abeta[i,6:10]<-sum.lm$coefficients[ , 4]  # Extract p-value for each predictor
+
+beta.ptau217.abeta[i,11:14]<-std.beta.ab$standardized.coefficients
+beta.ptau217.abeta[i,15:18]<-sum.lm.ab$coefficients[ , 4]  # Extract p-value for each predictor
+
+beta.ptau217.abeta[i,19:22]<-std.beta.ptau$standardized.coefficients
+beta.ptau217.abeta[i,23:26]<-sum.lm.ptau$coefficients[ , 4]  # Extract p-value for each predictor
+
+## For whole model with CSF p-tau and regional amyloid, extract adj R2 and model p-value
+beta.ptau217.abeta[i,27]<-sum.lm$adj.r.squared
+beta.ptau217.abeta[i,28]<-pf(sum.lm$fstatistic[1], sum.lm$fstatistic[2], sum.lm$fstatistic[3], lower.tail = FALSE) #Generate p-value from model summary
+
+## For model with regional amyloid, extract adj R2 and model p-value
+beta.ptau217.abeta[i,29]<-sum.lm.ab$adj.r.squared
+beta.ptau217.abeta[i,30]<-pf(sum.lm.ab$fstatistic[1], sum.lm.ab$fstatistic[2], sum.lm.ab$fstatistic[3], lower.tail = FALSE) 
+
+## For model with CSF p-tau, extract adj R2 and model p-value
+beta.ptau217.abeta[i,31]<-sum.lm.ptau$adj.r.squared
+beta.ptau217.abeta[i,32]<-pf(sum.lm.ptau$fstatistic[1], sum.lm.ptau$fstatistic[2], sum.lm.ptau$fstatistic[3], lower.tail = FALSE) 
+
+## For model with regional amyloid, CSF p-tau and BL tau SUVR, extract adj R2 and model p-value
+beta.ptau217.abeta[i,33:38]<-std.beta.bltau$standardized.coefficients
+beta.ptau217.abeta[i,39:44]<-sum.lm.bltau$coefficients[ , 4] 
+
+beta.ptau217.abeta[i,45:47]<-std.beta.age.sex$standardized.coefficients
+beta.ptau217.abeta[i,48:50]<-sum.lm.age.sex$coefficients[ , 4]  # Extract p-value for each predictor
+
+}
+
+beta.ptau217.abeta$p.fdr.Ab <- p.adjust(beta.ptau217.abeta$p.Ab, method = "fdr")
+beta.ptau217.abeta$p.fdr.CSFptau <- p.adjust(beta.ptau217.abeta$p.CSFptau, method = "fdr")
+
+beta.ptau217.abeta$p.fdr.ptau.CSFptau <- p.adjust(beta.ptau217.abeta$p.ptau.CSFptau, method = "fdr")
+beta.ptau217.abeta$p.fdr.Ab.Ab <- p.adjust(beta.ptau217.abeta$p.Ab.Ab, method = "fdr")
+
+beta.ptau217.abeta$p.fdr.bl.CSFptau <- p.adjust(beta.ptau217.abeta$p.bl.CSFptau, method = "fdr")
+beta.ptau217.abeta$p.fdr.bl.Ab <- p.adjust(beta.ptau217.abeta$p.bl.Ab, method = "fdr")
+
+beta.ptau217.abeta$Whole.model.fdr.p <- p.adjust(beta.ptau217.abeta$Whole.model.p, method = "fdr")
+beta.ptau217.abeta$Ab.model.fdr.p <- p.adjust(beta.ptau217.abeta$Ab.model.p, method = "fdr")
+beta.ptau217.abeta$CSF.model.fdr.p <- p.adjust(beta.ptau217.abeta$CSF.model.p, method = "fdr")
+
+beta.ptau217.abeta.CU_MCI_Ab.pos <- beta.ptau217.abeta
+write.csv(beta.ptau217.abeta.CU_MCI_Ab.pos, paste0(dir.source, "stat_models_regional_tauROC_CU_MCI_Abpos.csv"))
+
+```
+
+## Render beta values and p-values to pscalar files
+## pscalar will then be rendered using Connectome Workbench
+
+```{r pressure, echo=FALSE}
+
+## Make a list of dataframes to be rendered! 
+## Adjust this list depending on groups to be rendered
+listdf <- list(beta.ptau217.abeta.CU_MCI_Ab.pos, beta.ptau217.abeta.CU_Ab.neg, beta.ptau217.abeta.CU_Ab.pos,beta.ptau217.abeta.MCI_Ab.pos)
+list.name <- list(c("CU_MCI.Ab.pos"),c("CU.Ab.neg"),c("CU.Ab.pos"),c("MCI.Ab.pos"))
+
+  
+  for (n in 1:length(listdf)){
+  # Select first dataframe
+  current.df = listdf[[n]]
+
+  to_render<-current.df[,c('StdB.Ab','StdB.CSFptau','p.fdr.Ab','p.fdr.CSFptau', 'p.Ab','p.CSFptau',
+                        'StdB.Ab.Ab','StdB.ptau.CSFptau','p.fdr.Ab.Ab','p.fdr.ptau.CSFptau','p.Ab.Ab','p.ptau.CSFptau',
+                        'StdB.bl.Ab','StdB.bl.CSFptau','p.fdr.bl.Ab','p.fdr.bl.CSFptau','p.bl.Ab','p.bl.CSFptau',
+                        'Whole.model.adjR2','Whole.model.p','CSF.model.p','Ab.model.p' )]
+  
+  ## Threshold beta values images to keep only regions surviving FDR 
+  
+  to_render$StdB.fdr.Ab <- ifelse(to_render$p.fdr.Ab <= 0.05, to_render$StdB.Ab, 999) 
+  to_render$StdB.fdr.CSFptau <- ifelse(to_render$p.fdr.CSFptau <= 0.05 , to_render$StdB.CSFptau, 999) 
+  
+  to_render$StdB.fdr.Ab.Ab <- ifelse(to_render$p.fdr.Ab.Ab <= 0.05 , to_render$StdB.Ab.Ab, 999) 
+  to_render$StdB.fdr.ptau.CSFptau <- ifelse(to_render$p.fdr.ptau.CSFptau <= 0.05 , to_render$StdB.ptau.CSFptau, 999) 
+  
+  to_render$StdB.fdr.bl.Ab <- ifelse(to_render$p.fdr.bl.Ab <= 0.05, to_render$StdB.bl.Ab, 999) 
+  to_render$StdB.fdr.bl.CSFptau <- ifelse(to_render$p.fdr.bl.CSFptau <= 0.05, to_render$StdB.bl.CSFptau, 999)
+  
+  var.to.render=colnames(to_render)
+
+ dir.out.tmp = paste0(dir.workbench, "regional_analyses_ROC_LinearRegression/", list.name[n],"/")
+ dir.create(dir.out.tmp, recursive = T, showWarnings = F)
+
+for (i in 1:length(var.to.render)){
+  # define target group
+  current.var = var.to.render[i]
+  
+  outfile = paste0(list.name[n], current.var)
+  
+  tmp.render <- to_render[,i]
+  
+  outfile_txt=paste0(dir.out.tmp, outfile,".txt")
+  write.table(tmp.render,file = outfile_txt, row.names = F, col.names = F)
+  outfile_cifti=paste0(dir.out.tmp, outfile,".pscalar.nii")
+  render_to_Schaefer_200(outfile_txt, dir.out.tmp, outfile_cifti)
+  
+}
+  }
+
+```
+
+# Mediation analyses: CSF p-tau mediated assocation between regional amyloid and regional tau-PET rate of change
+```{r}
+
+### Calculate mediation by p-tau on amyloid accumulation at the regional level
+
+mediationnames=c('ACME.estimate','ACME.pvalue','Prop.mediated','Prop.mediated.pvalue','TotalEffect.estimate','TotalEffect.pvalue')
+mediation.abeta.ptau=data.frame(matrix(ncol = 6, nrow = 200))
+names(mediation.abeta.ptau) <- mediationnames
+
+
+for (i in 1:length(ROI.names)){
+  svMisc::progress(i, max.value = length(ROI.names))
+  
+   # select data 
+temp <- (sub.pet.tau.amyloid.longitudinal.ROC.SUVR[,c('MR_ID','CSF_ptau217_pgml_Lilly',
+           'age_bl', 'gender', paste0("tau.SUVR.Schaefer200.ROI.idx.", i),
+           paste0("amyloid.SUVR.Schaefer200.ROI.idx.", i),
+           paste0("tau.SUVR.Schaefer200.ROI.idx.", i,".ROC"),'diagnosis','DX.Ab')])
+
+temp<-na.omit(subset(temp,(DX.Ab=="Control.Ab.pos" | DX.Ab=="MCI.Ab.pos")))
+
+# Rename columns to make regression models easier
+## MAKE SURE INDEX MATCHES WITH TEMP DATASET
+colnames(temp)[6] <- "amyloid.ROI"
+colnames(temp)[5] <- "tau.bl.ROI"
+colnames(temp)[7] <- "tau.ROC.ROI"
+temp$amyloid.ROI<-as.numeric(temp$amyloid.ROI)
+temp$gender<-as.factor(temp$gender)
+
+
+### CSF p-tau217
+# amyloid on tau-PET rate of change
+tmp.lm.direct.effect <- lm(data = temp,
+                     scale(tau.ROC.ROI) ~ scale(amyloid.ROI) + age_bl + gender)
+
+# amyloid on CSF p-tau 
+tmp.lm.effect.on.mediator <- lm(data = temp,
+                     scale(CSF_ptau217_pgml_Lilly) ~ scale(amyloid.ROI) + age_bl + gender); 
+#summary(tmp.lm.direct.effect); summary(tmp.lm.effect.on.mediator)
+
+# amyloid on beta while adjusting for ptau
+tmp.lm.indirect.effect <- lm(data = temp,
+                     scale(tau.ROC.ROI) ~ scale(amyloid.ROI) + scale(CSF_ptau217_pgml_Lilly) + age_bl + gender); 
+#summary(tmp.lm.indirect.effect)
+
+
+# bootstrapped mediation
+# Estimation via quasi-Bayesian approximation
+set.seed(10)
+contcont <- mediation::mediate(model.m = tmp.lm.effect.on.mediator, model.y =  tmp.lm.indirect.effect, 
+                               sims=1000, 
+                               treat="scale(amyloid.ROI)",
+                               mediator="scale(CSF_ptau217_pgml_Lilly)", )
+
+mediation.abeta.ptau[i,1]<-contcont$d0 ## Save Average mediating effect (ACME) and corresponding p-value
+mediation.abeta.ptau[i,2]<-contcont$d0.p 
+mediation.abeta.ptau[i,3]<-contcont$n0 ## Save proportion mediated and corresponding p-value
+mediation.abeta.ptau[i,4]<-contcont$n0.p
+mediation.abeta.ptau[i,5]<-contcont$tau.coef  ## Save total effect and corresponding p-value
+mediation.abeta.ptau[i,6]<-contcont$tau.p
+
+}
+
+mediation.abeta.ptau$Prop.mediated.fdr.p <- p.adjust(mediation.abeta.ptau$Prop.mediated.pvalue, method = "fdr")
+
+write.csv(mediation.abeta.ptau, paste0(dir.source, "mediation_of_ptau_CU_MCI_Abpos_linear_regressionROC.csv"))
+
+## Project proportion mediated in regions were amyloid is related to tau-PET rate of change
+## Project all regions where proportion mediated survives FDR at p<0.05 
+
+mediation.abeta.ptau$Prop.mediated.to.render <- ifelse(mediation.abeta.ptau$Prop.mediated.fdr.p <= 0.05, mediation.abeta.ptau$Prop.mediated, 999) #to_render$Whole.model.p <=0.05
+
+  outfile = "Prop_mediated_ptau_CU.MCI.Ab.pos"
+  dir.out.tmp = paste0(dir.workbench, "regional_analyses_ROC_LinearRegression/CU_MCI.Ab.pos/")
+  
+  tmp.render <- mediation.abeta.ptau$Prop.mediated.to.render
+  
+  outfile_txt=paste0(dir.out.tmp, outfile,".txt")
+  write.table(tmp.render,file = outfile_txt, row.names = F, col.names = F)
+  outfile_cifti=paste0(dir.out.tmp, outfile,".pscalar.nii")
+  render_to_Schaefer_200(outfile_txt, dir.out.tmp, outfile_cifti)
+
+```
+
+### Calculate connectivity-based tau-PET rate of change based on individual epicenters
+```{r}
+tmp.data.ptau <- sub.pet.tau.amyloid.longitudinal.ROC.SUVR
+
+# Create empty dataframe to save epicenters
+ROI.names = paste0("tau.SUVR.Schaefer200.ROI.idx.", c(1:200))
+tau_epicenters <- data.frame(matrix(ncol = 200, nrow = length(tmp.data.ptau$MR_ID)))
+colnames(tau_epicenters)=ROI.names
+
+tmp.data.ptau$tau.epicenter.SUVR = NA
+tmp.data.ptau$tau.epicenter.ROC = NA
+tmp.data.ptau$beta.epicenter.fc.tau.ROC = NA
+
+# define epicenter cut rate
+#epicenter.ntile = 10  # For 20 regions as epicenters
+epicenter.ntile = 20  # For 10 regions as epicenters
+
+# List of common epicenters derived across whole-group
+current.epicenters=c(31, 32, 57, 58, 59, 64,74,75,76,77,100,101,102,135,162,163,164,168,186,188)
+epicenter<-replicate(200,0)
+epicenter[current.epicenters] <- 1
+
+# We will exclude these regions around motor cortex where GMM yields almost 1 distribution and SUVR are very low
+rois.perirolandic = c(27,28,29,30,129,130,131,132,133,134)
+
+# assess subject-level connectivity based tau spreading
+for (i in 1:nrow(tmp.data.ptau)){
+  current.data = tmp.data.ptau[i,]
+  current.tau.gmm = as.numeric(current.data[,paste0("tau.SUVR.Schaefer200.ROI.idx.",1:200,".gmm.weighted")])
+  current.tau = as.numeric(current.data[,paste0("tau.SUVR.Schaefer200.ROI.idx.",1:200)])
+  current.amyloid = as.numeric(current.data[,paste0("amyloid.SUVR.Schaefer200.ROI.idx.",1:200)])
+  current.tau.ROC = as.numeric(current.data[,paste0("tau.SUVR.Schaefer200.ROI.idx.",1:200,".ROC")])
+
+   ## Replace tau-PET probability in the regions to exclude by 0 so they will be in the lowest ntile
+  current.tau.gmm<- replace(current.tau.gmm, list=rois.perirolandic,0)
+
+  # determine epicenters
+  list.epi=ntile(current.tau.gmm, epicenter.ntile)
+  current.epicenters = which(ntile(current.tau.gmm, epicenter.ntile)==epicenter.ntile)
+  
+  # determine epicenter connectivity
+  current.epicenter.fc = colMeans(functional.connectivity.thr.distance[current.epicenters,])
+  current.nonepicenter.fc = colMeans(functional.connectivity.thr.distance[current.least.epicenters,])
+  
+  # compile in data frame
+  current.df = data.frame(tau = current.tau, 
+                          amyloid = current.amyloid, 
+                          tau.gmm = current.tau.gmm, 
+                          tau.ROC = current.tau.ROC, 
+                          epicenter.fc = current.epicenter.fc, 
+                          epicenter = as.numeric(ntile(current.tau.gmm, epicenter.ntile)==epicenter.ntile)
+                          )
+  
+  tau_epicenters[i,]<-t(current.df$epicenter)
+
+  
+  current.epicenter.lm <- lm.beta(lm(data = subset(current.df, epicenter != 1),
+                                     tau.ROC ~ epicenter.fc))
+  
+  tmp.data.ptau$beta.epicenter.fc.tau.ROC[i] = current.epicenter.lm$standardized.coefficients["epicenter.fc"][[1]]
+
+
+  # compute epicenter tau at baseline and longitudinal tau change
+  tmp.data.ptau$tau.epicenter.SUVR[i] = mean(current.tau[current.epicenters])
+  tmp.data.ptau$tau.epicenter.GMM [i] = mean(current.tau.gmm[current.epicenters])
+  tmp.data.ptau$tau.epicenter.ROC[i] = mean(current.tau.ROC[current.epicenters])
+
+}
+
+## Add ID and diagnosis to epicenters
+tau_epicenters$MR_ID<-sub.pet.tau.amyloid.longitudinal.ROC.SUVR$MR_ID
+tau_epicenters$diagnosis<-sub.pet.tau.amyloid.longitudinal.ROC.SUVR$diagnosis
+tau_epicenters$DX.Ab<-sub.pet.tau.amyloid.longitudinal.ROC.SUVR$DX.Ab
+
+write.csv(tau_epicenters,paste0(dir.source,"BF2_tau_PET_10epicenters_exclud_meningeal.csv"))  
+
+
+write.csv(tmp.data.ptau,paste0(dir.source,"connectivity_betas_10epicenters_ROC_LME.csv"))  
+
+ggplot(tmp.data.ptau, aes(x=group, y=beta.epicenter.fc.tau.ROC)) + geom_boxplot() + geom_point()
+
+```
+
+## Other analyses include simple regression models and mediation models to relate CSF p-tau217 and tau-PET rate of change to cognitive decline
